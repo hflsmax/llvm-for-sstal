@@ -53,6 +53,7 @@
 #include <iterator>
 
 #define DEBUG_TYPE "aa"
+#define LLVM_DEBUG(X) X
 
 using namespace llvm;
 
@@ -211,6 +212,7 @@ ModRefInfo AAResults::getModRefInfo(const Instruction *I, const CallBase *Call2,
 ModRefInfo AAResults::getModRefInfo(const CallBase *Call,
                                     const MemoryLocation &Loc,
                                     AAQueryInfo &AAQI) {
+  LLVM_DEBUG(dbgs() << "  Looking for mod/ref of: " << *Call << "  To: " << *Loc.Ptr << "\n");
   ModRefInfo Result = ModRefInfo::ModRef;
 
   for (const auto &AA : AAs) {
@@ -230,9 +232,11 @@ ModRefInfo AAResults::getModRefInfo(const CallBase *Call,
                 .getWithoutLoc(IRMemLocation::InaccessibleMem);
   if (ME.doesNotAccessMemory())
     return ModRefInfo::NoModRef;
+  LLVM_DEBUG(dbgs() << "  Memory effects: " << ME << "\n");
 
   ModRefInfo ArgMR = ME.getModRef(IRMemLocation::ArgMem);
   ModRefInfo OtherMR = ME.getWithoutLoc(IRMemLocation::ArgMem).getModRef();
+  LLVM_DEBUG(dbgs() << "  ModRef from call: " << ArgMR << "  Other: " << OtherMR << "\n");
   if ((ArgMR | OtherMR) != OtherMR) {
     // Refine the modref info for argument memory. We only bother to do this
     // if ArgMR is not a subset of OtherMR, otherwise this won't have an impact
@@ -245,19 +249,24 @@ ModRefInfo AAResults::getModRefInfo(const CallBase *Call,
       unsigned ArgIdx = I.index();
       MemoryLocation ArgLoc = MemoryLocation::getForArgument(Call, ArgIdx, TLI);
       AliasResult ArgAlias = alias(ArgLoc, Loc, AAQI, Call);
-      if (ArgAlias != AliasResult::NoAlias)
+      if (ArgAlias != AliasResult::NoAlias) {
+        LLVM_DEBUG(dbgs() << "  Arg " << ArgIdx << " ModRef: " << getArgModRefInfo(Call, ArgIdx) << "\n");
         AllArgsMask |= getArgModRefInfo(Call, ArgIdx);
+      }
     }
     ArgMR &= AllArgsMask;
   }
 
   Result &= ArgMR | OtherMR;
+  LLVM_DEBUG(dbgs() << "  Final modref: " << Result << "\n");
 
   // Apply the ModRef mask. This ensures that if Loc is a constant memory
   // location, we take into account the fact that the call definitely could not
   // modify the memory location.
-  if (!isNoModRef(Result))
+  if (!isNoModRef(Result)) {
+    LLVM_DEBUG(dbgs() << "  ModRef mask: " << getModRefInfoMask(Loc) << "\n");
     Result &= getModRefInfoMask(Loc);
+  }
 
   return Result;
 }
@@ -374,6 +383,7 @@ MemoryEffects AAResults::getMemoryEffects(const CallBase *Call,
   MemoryEffects Result = MemoryEffects::unknown();
 
   for (const auto &AA : AAs) {
+    LLVM_DEBUG(dbgs() << "  Memory effect from AA " << AA->getMemoryEffects(Call, AAQI) << "\n");
     Result &= AA->getMemoryEffects(Call, AAQI);
 
     // Early-exit the moment we reach the bottom of the lattice.
@@ -721,8 +731,10 @@ bool AAResults::canInstructionRangeModRef(const Instruction &I1,
   ++E;  // Convert from inclusive to exclusive range.
 
   for (; I != E; ++I) // Check every instruction in range
-    if (isModOrRefSet(getModRefInfo(&*I, Loc) & Mode))
+    if (isModOrRefSet(getModRefInfo(&*I, Loc) & Mode)) {
+      LLVM_DEBUG(dbgs() << "  ModRef by: " << *I << "  To: " << *Loc.Ptr << "\n");
       return true;
+    }
   return false;
 }
 

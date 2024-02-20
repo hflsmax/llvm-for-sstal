@@ -78,6 +78,7 @@
 using namespace llvm;
 
 #define DEBUG_TYPE "argpromotion"
+#define LLVM_DEBUG(X) X
 
 STATISTIC(NumArgumentsPromoted, "Number of pointer arguments promoted");
 STATISTIC(NumArgumentsDead, "Number of dead pointer args eliminated");
@@ -429,8 +430,11 @@ static bool allCallersPassValidPointerForArgument(Argument *Arg,
   APInt Bytes(64, NeededDerefBytes);
 
   // Check if the argument itself is marked dereferenceable and aligned.
-  if (isDereferenceableAndAlignedPointer(Arg, NeededAlign, Bytes, DL))
+  if (isDereferenceableAndAlignedPointer(Arg, NeededAlign, Bytes, DL)) {
+    LLVM_DEBUG(dbgs() << "ArgPromotion of " << *Arg << " succeeded: "
+                      << "always dereferenceable and aligned\n");
     return true;
+  }
 
   // Look at all call sites of the function.  At this point we know we only have
   // direct callees.
@@ -446,6 +450,8 @@ static bool allCallersPassValidPointerForArgument(Argument *Arg,
 static bool findArgParts(Argument *Arg, const DataLayout &DL, AAResults &AAR,
                          unsigned MaxElements, bool IsRecursive,
                          SmallVectorImpl<OffsetAndArgPart> &ArgPartsVec) {
+  LLVM_DEBUG(dbgs() << "ArgPromotion of " << *Arg << " in " << Arg->getParent()->getName()
+                    << "\n");
   // Quick exit for unused arguments
   if (Arg->use_empty())
     return true;
@@ -486,6 +492,8 @@ static bool findArgParts(Argument *Arg, const DataLayout &DL, AAResults &AAR,
     APInt Offset(DL.getIndexTypeSizeInBits(Ptr->getType()), 0);
     Ptr = Ptr->stripAndAccumulateConstantOffsets(DL, Offset,
                                                  /* AllowNonInbounds */ true);
+    LLVM_DEBUG(dbgs() << "  considering: " << *I << " with offset " << Offset
+                      << " and stripped ptr " << *Ptr << "\n");
     if (Ptr != Arg)
       return std::nullopt;
 
@@ -499,8 +507,11 @@ static bool findArgParts(Argument *Arg, const DataLayout &DL, AAResults &AAR,
 
     // If this is a recursive function and one of the types is a pointer,
     // then promoting it might lead to recursive promotion.
-    if (IsRecursive && Ty->isPointerTy())
-      return false;
+    // if (IsRecursive && Ty->isPointerTy()) {
+    //   LLVM_DEBUG(dbgs() << "ArgPromotion of " << *Arg << " failed: "
+    //                     << "recursive function with pointer type\n");
+    //   return false;
+    // }
 
     int64_t Off = Offset.getSExtValue();
     auto Pair = ArgParts.try_emplace(
@@ -512,7 +523,7 @@ static bool findArgParts(Argument *Arg, const DataLayout &DL, AAResults &AAR,
     // the aggregate.
     if (MaxElements > 0 && ArgParts.size() > MaxElements) {
       LLVM_DEBUG(dbgs() << "ArgPromotion of " << *Arg << " failed: "
-                        << "more than " << MaxElements << " parts\n");
+                        << ArgParts.size() << " more than " << MaxElements << " parts\n");
       return false;
     }
 
@@ -557,8 +568,11 @@ static bool findArgParts(Argument *Arg, const DataLayout &DL, AAResults &AAR,
     else if (StoreInst *SI = dyn_cast<StoreInst>(&I))
       Res = HandleEndUser(SI, SI->getValueOperand()->getType(),
                           /* GuaranteedToExecute */ true);
-    if (Res && !*Res)
+    if (Res && !*Res) {
+      LLVM_DEBUG(dbgs() << "ArgPromotion of " << *Arg << " failed: "
+                        << "entry block load/store not promotable\n");
       return false;
+    }
 
     if (!isGuaranteedToTransferExecutionToSuccessor(&I))
       break;
@@ -575,6 +589,7 @@ static bool findArgParts(Argument *Arg, const DataLayout &DL, AAResults &AAR,
         Worklist.push_back(&U);
   };
   AppendUses(Arg);
+  bool usedByCall = false;
   while (!Worklist.empty()) {
     const Use *U = Worklist.pop_back_val();
     Value *V = U->getUser();
@@ -584,15 +599,21 @@ static bool findArgParts(Argument *Arg, const DataLayout &DL, AAResults &AAR,
     }
 
     if (auto *GEP = dyn_cast<GetElementPtrInst>(V)) {
-      if (!GEP->hasAllConstantIndices())
+      if (!GEP->hasAllConstantIndices()) {
+        LLVM_DEBUG(dbgs() << "ArgPromotion of " << *Arg << " failed: "
+                          << "non-constant GEP\n");
         return false;
+      }
       AppendUses(V);
       continue;
     }
 
     if (auto *LI = dyn_cast<LoadInst>(V)) {
-      if (!*HandleEndUser(LI, LI->getType(), /* GuaranteedToExecute */ false))
+      if (!*HandleEndUser(LI, LI->getType(), /* GuaranteedToExecute */ false)) {
+        LLVM_DEBUG(dbgs() << "ArgPromotion of " << *Arg << " failed: " << *LI
+                          << "load not promotable\n");
         return false;
+      }
       Loads.push_back(LI);
       continue;
     }
@@ -602,11 +623,27 @@ static bool findArgParts(Argument *Arg, const DataLayout &DL, AAResults &AAR,
     if (AreStoresAllowed && SI &&
         U->getOperandNo() == StoreInst::getPointerOperandIndex()) {
       if (!*HandleEndUser(SI, SI->getValueOperand()->getType(),
-                          /* GuaranteedToExecute */ false))
+                          /* GuaranteedToExecute */ false)) {
+        LLVM_DEBUG(dbgs() << "ArgPromotion of " << *Arg << " failed: "
+                          << "store not promotable\n");
         return false;
+      }
       continue;
       // Only stores TO the argument is allowed, all the other stores are
       // unknown users
+    }
+
+    if (auto *CB = dyn_cast<CallBase>(V)) {
+      if (!IsRecursive)
+        return false;
+      if (auto *F = CB->getCalledFunction()) {
+        usedByCall = true;
+        unsigned ArgNo = CB->getArgOperandNo(U);
+        if (F->hasParamAttribute(ArgNo, Attribute::ReadOnly) || 
+            F->hasParamAttribute(ArgNo, Attribute::ReadNone)) {
+          continue;
+        }
+      }
     }
 
     // Unknown user.
@@ -620,13 +657,25 @@ static bool findArgParts(Argument *Arg, const DataLayout &DL, AAResults &AAR,
     if (!allCallersPassValidPointerForArgument(Arg, NeededAlign,
                                                NeededDerefBytes)) {
       LLVM_DEBUG(dbgs() << "ArgPromotion of " << *Arg << " failed: "
-                        << "not dereferenceable or aligned\n");
+                        << "not dereferenceable or aligned, needed" << NeededDerefBytes
+                        << " bytes and alignment " << NeededAlign.value() << "\n");
       return false;
     }
   }
 
-  if (ArgParts.empty())
-    return true; // No users, this is a dead argument.
+  if (ArgParts.empty()) {
+    if (usedByCall) {
+      LLVM_DEBUG(dbgs() << "ArgPromotion of " << *Arg << " failed: "
+                        << "used by call\n");
+      // This is not a dead argument
+      return false;
+    } else {
+      LLVM_DEBUG(dbgs() << "ArgPromotion of " << *Arg << " succeed: "
+                        << "dead argument\n");
+      // This is a dead argument
+      return true;
+    }
+  }
 
   // Sort parts by offset.
   append_range(ArgPartsVec, ArgParts);
@@ -635,11 +684,23 @@ static bool findArgParts(Argument *Arg, const DataLayout &DL, AAResults &AAR,
   // Make sure the parts are non-overlapping.
   int64_t Offset = ArgPartsVec[0].first;
   for (const auto &Pair : ArgPartsVec) {
-    if (Pair.first < Offset)
+    if (Pair.first < Offset) {
+      LLVM_DEBUG(dbgs() << "ArgPromotion of " << *Arg << " failed: "
+                        << "overlapping parts\n");
       return false; // Overlap with previous part.
+    }
 
     Offset = Pair.first + DL.getTypeStoreSize(Pair.second.Ty);
   }
+
+  // log ArgPartsVec
+  LLVM_DEBUG({
+    dbgs() << "ArgPartsVec for " << *Arg << ":\n";
+    for (const auto &Pair : ArgPartsVec) {
+      dbgs() << "  Offset: " << Pair.first << ", Type: " << *Pair.second.Ty
+             << ", Alignment: " << Pair.second.Alignment.value() << "\n";
+    }
+  });
 
   // If store instructions are allowed, the path from the entry of the function
   // to each load may be not free of instructions that potentially invalidate
@@ -662,16 +723,22 @@ static bool findArgParts(Argument *Arg, const DataLayout &DL, AAResults &AAR,
     BasicBlock *BB = Load->getParent();
 
     MemoryLocation Loc = MemoryLocation::get(Load);
-    if (AAR.canInstructionRangeModRef(BB->front(), *Load, Loc, ModRefInfo::Mod))
+    if (AAR.canInstructionRangeModRef(BB->front(), *Load, Loc, ModRefInfo::Mod)) {
+      LLVM_DEBUG(dbgs() << "ArgPromotion of " << *Arg << " failed: "
+                        << "load invalidated because of mod instruction\n");
       return false; // Pointer is invalidated!
+    }
 
     // Now check every path from the entry block to the load for transparency.
     // To do this, we perform a depth first search on the inverse CFG from the
     // loading block.
     for (BasicBlock *P : predecessors(BB)) {
       for (BasicBlock *TranspBB : inverse_depth_first_ext(P, TranspBlocks))
-        if (AAR.canBasicBlockModify(*TranspBB, Loc))
+        if (AAR.canBasicBlockModify(*TranspBB, Loc)) {
+          LLVM_DEBUG(dbgs() << "ArgPromotion of " << *Arg << " failed: "
+                            << "load " << *Load << " is invalidated because of mod block\n");
           return false;
+        }
     }
   }
 
@@ -789,18 +856,34 @@ static Function *promoteArguments(Function *F, FunctionAnalysisManager &FAM,
 
       if (areTypesABICompatible(Types, *F, TTI)) {
         NumArgsAfterPromote += ArgParts.size() - 1;
+        // log PtrArg and ArgParts
+        LLVM_DEBUG({
+          dbgs() << "ArgParts for " << *PtrArg << ":\n";
+          for (const auto &Pair : ArgParts) {
+            dbgs() << "  Offset: " << Pair.first << ", Type: " << *Pair.second.Ty
+                   << ", Alignment: " << Pair.second.Alignment.value() << "\n";
+          }
+        });
         ArgsToPromote.insert({PtrArg, std::move(ArgParts)});
       }
     }
   }
 
   // No promotable pointer arguments.
-  if (ArgsToPromote.empty())
+  if (ArgsToPromote.empty()) {
+    LLVM_DEBUG(dbgs() << "ArgPromotion of " << F->getName() << " failed: "
+                      << "no promotable pointer arguments\n");
     return nullptr;
+  }
 
-  if (NumArgsAfterPromote > TTI.getMaxNumArgs())
+  if (NumArgsAfterPromote > TTI.getMaxNumArgs()) {
+    LLVM_DEBUG(dbgs() << "ArgPromotion of " << F->getName() << " failed: "
+                      << "too many arguments after promotion\n");
     return nullptr;
+  }
 
+  LLVM_DEBUG(dbgs() << "ArgPromotion of " << F->getName() << ": " << ArgsToPromote.size()
+                    << " of " << PointerArgs.size() << " arguments promotable\n");
   return doPromotion(F, FAM, ArgsToPromote);
 }
 
